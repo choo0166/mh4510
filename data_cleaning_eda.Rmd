@@ -1,0 +1,261 @@
+---
+title: "MH4510 Data Cleaning and EDA"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+# Data
+
+## Loading Data into R
+
+```{r}
+library(tidyverse) # for manipulation with data
+library(tm) # for text mining
+library(qdapRegex) # additional tools for text preprocessing
+library(wordcloud) # for text visualization
+set.seed(0)
+
+fake_n <- read_csv("Fake.csv")
+true_n <- read_csv("True.csv")
+```
+
+## Data Processing
+
+In our dataset, news labeled real are collected from Reuters, while news labeled fake are collected from a variety of sources. As part of text preprocessing, we will carry out the following to build the corpus:
+
+* Remove urls, hashtags and mentions
+* Remove common stopwords
+* Remove punctuation, numbers and excess whitespace
+* Excluding words with 3 or less characters
+
+We'll also define the ground truth labels $Y$ to be $1$ for news labeled fake.
+
+```{r}
+library(mgsub)
+# Fix preprocessing of contractions in dataset
+matches <- c('couldn t', 'didn t', 'doesn t', 
+             'hadn t', 'hasn t', 'haven t', 
+             'mustn t', 'shouldn t', 'wouldn t')
+subs <- c("couldn't", "didn't", "doesn't", 
+          "hadn't", "hasn't", "haven't", 
+          "mustn't", "shouldn't", "wouldn't")
+
+fake_n$text <- sapply(fake_n$text, 
+                      FUN = mgsub, 
+                      pattern = matches, 
+                      replacement = subs, 
+                      ignore.case = T )
+true_n$text <- sapply(true_n$text, 
+                      FUN = mgsub, 
+                      pattern = matches, 
+                      replacement = subs, 
+                      ignore.case = T )
+
+fake_n <- fake_n %>%
+  filter(text != "") %>%
+  mutate(cleaned_text = tolower(text)) %>%
+  mutate(cleaned_text = gsub("(http[^ ]*)|(www\\.[^ ]*)", " ", cleaned_text)) %>%  # remove urls
+  mutate(cleaned_text = gsub("pic.twitter.com\\/[^ ]*", " ", cleaned_text)) %>%  # remove twitter pic urls
+  mutate(cleaned_text = gsub("\\B@\\w+", " ", cleaned_text)) %>%  # remove mentions
+  mutate(cleaned_text = gsub("\\B#\\w+", " ", cleaned_text)) %>%  # remove hashtags
+  mutate(cleaned_text = gsub("[^a-z']", " ", cleaned_text)) %>% 
+  mutate(Y = 1) 
+
+true_n <- true_n %>%
+  filter(text != "") %>%
+  mutate(cleaned_text = tolower(text)) %>%
+  mutate(cleaned_text = gsub(".*reuters) ","", cleaned_text)) %>%  # remove Reuters tagline
+  mutate(cleaned_text = gsub("(http[^ ]*)|(www\\.[^ ]*)", " ", cleaned_text)) %>%  # remove urls
+  mutate(cleaned_text = gsub("pic.twitter.com\\/[^ ]*", " ", cleaned_text)) %>%  # remove twitter pic urls
+  mutate(cleaned_text = gsub("\\B@\\w+", " ", cleaned_text)) %>%  # remove mentions
+  mutate(cleaned_text = gsub("\\B#\\w+", " ", cleaned_text)) %>%  # remove hashtags
+  mutate(cleaned_text = gsub("[^a-z']", " ", cleaned_text)) %>%  
+  mutate(Y = 0) 
+
+# Combine into single dataset while removing duplicates
+X <- bind_rows(fake_n, true_n) %>% 
+  distinct_at(vars(cleaned_text), .keep_all = T) 
+X$Y <- as.factor(X$Y)
+```
+
+## Document-Term Matrix
+
+Below we construct the document-term matrix for all articles in our dataset while removing stopwords, punctuation, whitespace and excluding words with 3 characters or less.
+
+```{r}
+corpus <- VCorpus(VectorSource(X$cleaned_text)) %>%
+  tm_map(removeWords, stopwords(kind = "en")) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(stripWhitespace) %>%
+  tm_map(content_transformer(function(x) qdapRegex::rm_nchar_words(x, "1,3")))  # remove any words with 3 characters or less
+  
+DTM <- DocumentTermMatrix(corpus)  
+inspect(DTM)
+
+# Combine text cleaning applied to corpus for tokenization
+X <- X %>% mutate(cleaned_text = lapply(1:nrow(X), function(x) {
+    corpus[[x]]$content
+})) %>% filter(cleaned_text != "")
+# write.csv(X, "./cleaned.csv", row.names = F)
+```
+
+And the wordcloud for words whose total frequency is at least 50.
+
+```{r}
+word_freq <- sort(slam::col_sums(DTM), decreasing = T)
+pdf("freq_wordcloud.pdf",  width = 5, height = 5)
+wordcloud(words = names(word_freq), 
+          freq = word_freq, 
+          min.freq = 50,
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+dev.off()
+```
+
+From the wordcloud, we see that the most frequent words are those related to US politics. Let's examine the distribution of news topics by class:
+
+```{r}
+X %>% group_by(subject, Y) %>% 
+  summarise(n = n()) %>%
+  arrange(desc(Y))
+```
+
+As expected, most news seem to fall under the subject of politics. We can visualize the corpus for fake and real news:
+
+```{r}
+corpus_fake <- VCorpus(VectorSource(X[(X$Y == 1),]$cleaned_text))
+
+dtm_fake <- DocumentTermMatrix(corpus_fake)
+
+corpus_real <- VCorpus(VectorSource(X[(X$Y == 0),]$cleaned_text))                            
+
+dtm_real <- DocumentTermMatrix(corpus_real)
+
+word_freq.fake <- sort(slam::col_sums(dtm_fake), decreasing = T)
+word_freq.real <- sort(slam::col_sums(dtm_real), decreasing = T)
+
+# pdf("fake_wordcloud.pdf",  width = 5, height = 5)
+# wordcloud for fake news
+wordcloud(words = names(word_freq.fake), 
+          freq = word_freq.fake, 
+          min.freq = 50, 
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+# dev.off()
+
+wf_fake.df <- data.frame(word = names(word_freq.fake), freq = word_freq.fake)
+# pdf("fake_freq.pdf",  width = 7.5, height = 5)
+# barplot of top 30 word frequencies
+wf_fake.df %>% top_n(30) %>%
+ggplot(aes(x = reorder(word, freq), y = freq)) + 
+geom_bar(stat="identity", fill="darkred", colour="darkgreen") +
+coord_flip() + 
+labs(title = "Top 30 words in fake news", x = "words", y = "frequency")
+# dev.off()
+
+# pdf("real_wordcloud.pdf",  width = 5, height = 5)
+# wordcloud for real news
+wordcloud(words = names(word_freq.real), 
+          freq = word_freq.real, 
+          min.freq = 50, 
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+# dev.off()
+
+wf_real.df <- data.frame(word = names(word_freq.real), freq = word_freq.real)
+# barplot of top 30 word frequencies
+# pdf("real_freq.pdf",  width = 7.5, height = 5)
+wf_real.df %>% top_n(30) %>%
+ggplot(aes(x = reorder(word, freq), y = freq)) + 
+geom_bar(stat="identity", fill="darkred", colour="darkgreen") +
+coord_flip() + 
+labs(title = "Top 30 words in real news", x = "words", y = "frequency")
+# dev.off()
+
+# create DTM with tf-idf weights instead of counts
+DTM <- DocumentTermMatrix(corpus, control = list(weighting = weightTfIdf))
+inspect(DTM)
+```
+
+We can plot a new wordcloud using tf-idf weights:
+
+```{r}
+word_freq <- sort(slam::col_sums(DTM), decreasing = T)
+# pdf("tfidf_wordcloud.pdf",  width = 5, height = 5)
+wordcloud(words = names(word_freq), 
+          freq = word_freq, 
+          min.freq = 50,
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+# dev.off()
+
+wf_tfidf <- data.frame(word = names(word_freq), total_tfidf = word_freq)
+# pdf("tfidf_freq.pdf",  width = 7.5, height = 5)
+wf_tfidf %>% top_n(30) %>% 
+ggplot(aes(x = reorder(word,total_tfidf), y = total_tfidf)) + 
+geom_bar(stat = "identity") + 
+coord_flip() + 
+labs(title = "Top 30 TF-IDF counts of words", x = "words", y = "TF-IDF")
+# dev.off()
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+

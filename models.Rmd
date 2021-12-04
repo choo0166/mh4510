@@ -1,0 +1,698 @@
+---
+title: "MH4510 Models"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+# Data
+
+## Loading Data into R
+
+```{r message=FALSE}
+library(tidyverse) # for manipulation with data
+library(caret) # for machine learning, including KNN
+library(tm) # for text mining
+library(qdapRegex) # additional tools for text preprocessing
+library(wordcloud) # for text visualization
+library(lubridate) # for working with time 
+library(Matrix) # for creating sparse matrix objects
+set.seed(0)
+
+X <- read_csv("cleaned.csv")
+X$Y <- as.factor(X$Y)
+```
+
+## Training and Test Sets
+
+As news stories tend to cluster across time, random splitting into training and test sets may not be appropriate. It is expected that multiple news articles from different sources may report the same event, and a classifier that is trained on articles reporting the same/similar events in both the training and test splits may result in overly optimistic predictions.
+
+Another factor to consider is that the sources in our training and test splits are identical, which may bias prediction accuracies upward as the classifier may directly memorize site-label mappings instead of modelling the actual task of fake news detection. Hence, to more accurately measure the generalizability of the model, we will also consider using a dataset from an unseen source and with varying topics from the training set as the test set.
+
+```{r}
+# Convert date string to date object
+# X$date <- X$date %>% mdy
+
+# pdf("news_date.pdf",  width = 10, height = 5)
+
+# Plot distribution of news as time series
+X %>% group_by(date, Y) %>% 
+summarise(n = n()) %>% 
+ggplot(aes(x = date, y = n, group = Y, colour = Y)) + geom_line()
+
+# dev.off()
+```
+
+Observe that there are no real news before 2016 and real news dominates fake news towards the end of 2017. To ensure a balanced representation of real and fake news in the training split, we can only consider splits between 2016 and before late 2017. We can visualize the corpus for news in the period between 2016 and 2017, and from the latter half of 2017 to 2018.
+
+```{r}
+X.2016_2017 <- X %>% filter(year(date) == 2016)
+X.2017_2018 <- X %>% filter((year(date) == 2017 & month(date) >= 6)| year(date) == 2018)
+
+corpus.2016_2017 <- VCorpus(VectorSource(X.2016_2017$cleaned_text))  
+
+corpus.2017_2018 <- VCorpus(VectorSource(X.2017_2018$cleaned_text))                          
+
+dtm.2016_2017 <- DocumentTermMatrix(corpus.2016_2017)
+dtm.2017_2018 <- DocumentTermMatrix(corpus.2017_2018)
+
+word_freq.2016_2017 <- sort(slam::col_sums(dtm.2016_2017), decreasing = T)
+word_freq.2017_2018 <- sort(slam::col_sums(dtm.2017_2018), decreasing = T)
+
+# pdf("1617_wordcloud.pdf",  width = 5, height = 5)
+
+# Wordclouds
+wordcloud(words = names(word_freq.2016_2017), 
+          freq = word_freq.2016_2017, 
+          min.freq = 50, 
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+# dev.off()
+
+wf_2016_2017.df <- data.frame(word = names(word_freq.2016_2017), freq = word_freq.2016_2017)
+# barplot of top 30 word frequencies
+# wf_2016_2017.df %>% top_n(30) %>%
+# ggplot(aes(x = reorder(word, freq), y = freq)) + 
+# geom_bar(stat="identity", fill="darkred", colour="darkgreen") +
+# coord_flip() + 
+# labs(x = "words", y = "frequency")
+
+# pdf("1718_wordcloud.pdf",  width = 5, height = 5)
+
+wordcloud(words = names(word_freq.2017_2018), 
+          freq = word_freq.2017_2018, 
+          min.freq = 50, 
+          max.words = 150, 
+          random.order=FALSE, 
+          rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+# dev.off()
+
+wf_2017_2018.df <- data.frame(word = names(word_freq.2017_2018), freq = word_freq.2017_2018)
+# barplot of top 100 word frequencies
+# wf_2017_2018.df %>% top_n(30) %>%
+# ggplot(aes(x = reorder(word, freq), y = freq)) + 
+# geom_bar(stat="identity", fill="darkred", colour="darkgreen") +
+# coord_flip() + 
+# labs(x = "words", y = "frequency")
+```
+
+From the wordclouds, the news topics in the two time periods appear more distinct and have a smaller overlap. Let's check the dimensions of the two data splits.
+
+```{r}
+X_train <- X.2016_2017[sample(nrow(X.2016_2017)),]  # shuffle dataset
+X_test <- X.2017_2018[sample(nrow(X.2017_2018)),]
+cat("Training data dimensions =", dim(X_train), "\n")
+cat("Test data dimensions =", dim(X_test), "\n")
+
+# Check the distribution of classes in training set
+X_train %>% group_by(Y) %>% 
+summarise(n = n())
+```
+
+The class ratio is roughly 1:2, so we may ignore this mild imbalance.
+
+# Feature Extraction
+
+To train machine learning models on text, we have to convert the words into numerical representations. In the document-term matrix, we first build the dictionary of unique words (corpus) from the documents or articles in the dataset and each document is converted to a feature vector of counts of each word in the dictionary. This is the \textbf{bag-of-words} model. An alternative to vectorizing text is \textbf{TF-IDF} and the \textbf{fastText} word embedding technique.
+
+## Term-frequency (TF), Inverse Term-frequency (IDF)
+
+The IDF decreases the weight for commonly used words and increases the weight for words that are uncommonly used across all documents. Multiplying TF and IDF gives TF-IDF, which measures the significance of a word to a document in a collection of documents. The TF-IDF for a word in a document is large when it is uncommonly used across the collection of documents and commonly used in the document. Similarly, the TF-IDF for a word is small in a document when a word is commonly used across all documents and uncommon in the particular document.
+
+## fastText
+
+As the TF-IDF feature vectors do not preserve the order of words in the original text, this makes it unsuitable for use in sequence models such as in recurrent neural networks. Instead, we will apply the fastText word level embeddings as the inputs for sequence models.
+
+### Training fastText word embeddings
+
+Options are:
+
+* Use pretrained word embeddings from https://fasttext.cc/docs/en/english-vectors.html
+* Train word embedding from dataset (using Gensim library in Python)
+
+Here, we will train the word embeddings on the dataset and visualize them using t-SNE.
+
+```{r}
+library(reticulate) # for calling python functions in R
+# py_install("gensim")  # To install packages, enable internet in notebook settings
+gensim <- import("gensim") # import the gensim library
+ft <- gensim$models$FastText # extract fasttext model
+
+# create iterable over articles and splitting sentences into words 
+it_sentences <- as.list(X_train$cleaned_text) %>% sapply(FUN = strsplit, split = " ")
+
+ftmodel <- ft(vector_size = 100L, min_count = 1L, workers = 1L, sg = 1L)  # Returns 100-dimensional vector for each word
+ftmodel$build_vocab(corpus_iterable = it_sentences)
+ftmodel$train(corpus_iterable = it_sentences, total_examples = ftmodel$corpus_count, epochs = 5L)
+
+length(ftmodel$wv$index_to_key)  # Number of word embeddings in corpus
+
+# "incorruptible" %in% ftmodel$wv$index_to_key
+# as.vector(ftmodel$wv["incorruptible"])  # embedding for OOV word
+
+# Pick out interesting words to plot
+keywords = c("trump", "clinton", "obama", "president", 
+             "election", "government", "reuters", "media",
+             "news", "twitter", "reporters", "china", "america", 
+             "russia", "party", "court", "order", "right", "policy",
+             "trade", "security", "people")
+embeddings <- c()
+embeddings <- sapply(keywords, function(word) {
+    embedding <- as.vector(ftmodel$wv[word])
+    embeddings <- rbind(embeddings, embedding)
+}) %>% t() %>% as.data.frame
+```
+
+### t-SNE
+
+```{r}
+library(Rtsne) # for t-SNE
+library(ggrepel) # for adding text labels to plots
+tsne <- embeddings %>% Rtsne(perplexity = 3)
+
+# pdf("tsne.pdf",  width = 7.5, height = 5)
+
+tsne$Y %>% as_tibble %>% cbind(keywords) %>%
+  ggplot(aes(x = V1, y = V2, label = keywords)) +
+  geom_point(size = 0.5) + 
+  geom_label_repel(aes(label = keywords), box.padding = 0.35, point.padding = 0.5, segment.color = 'grey50') +
+  theme_classic()
+
+# dev.off()
+```
+
+# Modelling
+
+## Logistic Regression
+
+We will train an elastic net model using the tf-idf feature vectors with 5 fold cross-validation.
+
+```{r}
+library(text2vec)
+# dim(X_train)
+# dim(X_test)
+
+it_train <- itoken(X_train$cleaned_text, tokenizer = word_tokenizer)
+it_test <- itoken(X_test$cleaned_text, tokenizer = word_tokenizer)
+# Create vocabulary from training set
+vocab <- create_vocabulary(it_train) 
+# Dimension reduction (only include terms 
+# that occur in at least 1% of documents)
+p_vocab <- prune_vocabulary(vocab, doc_proportion_min = 0.01)  
+vectorizer <- vocab_vectorizer(p_vocab)
+
+# Define Tf-idf model
+tfidf = TfIdf$new()
+# Fit model to train data and transform train data with fitted model
+dtm_train <- create_dtm(it_train, vectorizer) %>% fit_transform(tfidf)
+# tfidf modified by fit_transform() call!
+# Apply pre-trained tf-idf transformation to test data
+dtm_test <- create_dtm(it_test, vectorizer) %>% transform(tfidf)
+
+# Check dimensions of training and test sets
+# dim(dtm_train)
+# dim(dtm_test)
+
+yTrain <- X_train %>% select(Y) %>% as.matrix()
+yTest <- X_test %>% select(Y) %>% as.matrix()
+
+elastic_net.t2v <- train(x = dtm_train, y = yTrain, method = "glmnet",
+                        tuneGrid = expand.grid(alpha = seq(from = 0, to = 1, by = 0.1), 
+                         lambda = 10^(seq(from = -2, to = 2, length = 5))),
+                         trControl = trainControl("cv", number = 5, trim = T, returnData = F)
+                        )
+# saveRDS(elastic_net.t2v, file = "./elasticnet.RDS")
+
+elastic_net.t2v
+
+# pdf("elasticnet_tfidf.pdf",  width = 7.5, height = 5)
+
+plot(elastic_net.t2v)
+
+# dev.off()
+
+elastic_net.t2v %>% predict(dtm_test) %>% confusionMatrix(.,as.factor(yTest))
+```
+
+Now, we will train a logistic regression model using fastText word embeddings.
+
+```{r}
+dtm_train <- create_dtm(it_train, vectorizer)  # N * vocabulary size
+dtm_test <- create_dtm(it_test, vectorizer)
+# Build embedding matrix for words in training vocab
+vec <- c()
+vec <- sapply(p_vocab$term, function(word) {
+    wd_embedding <- as.vector(ftmodel$wv[word])
+    if (is.null(wd_embedding)) {
+            wd_embedding <- rep(0, 100)
+        }
+    vec <- rbind(vec, wd_embedding)
+}) %>% t()
+# dim(vec)
+
+# Convert to sparse matrix object
+vec <- Matrix(vec, sparse = T)
+# class(vec)
+
+# Matrix of document-level embeddings
+ft_dtm_train <- normalize(dtm_train, norm = "l1") %*% vec
+ft_dtm_test <- normalize(dtm_test, norm = "l1") %*% vec
+colnames(ft_dtm_train) <- colnames(ft_dtm_train, do.NULL = F, prefix = "V")
+colnames(ft_dtm_test) <- colnames(ft_dtm_test, do.NULL = F, prefix = "V")
+# dim(ft_dtm_train)
+# dim(ft_dtm_test)
+
+elastic_net.ft <- train(
+  x = ft_dtm_train, y = yTrain, method = "glmnet",
+  tuneGrid = expand.grid(alpha = seq(from = 0, to = 1, by = 0.1), 
+                         lambda = 10^(seq(from = -2, to = 2, length = 5))),
+  trControl = trainControl("cv", number = 5, trim = T, returnData = F)
+)
+# saveRDS(elastic_net.ft, file = "./elasticnet_ft.RDS")
+
+elastic_net.ft
+
+# pdf("elasticnet_ft.pdf",  width = 7.5, height = 5)
+
+plot(elastic_net.ft)
+
+# dev.off()
+
+elastic_net.ft %>% predict(ft_dtm_test) %>% confusionMatrix(.,as.factor(yTest))
+```
+
+## Recurrent Neural Network
+
+We will train a bidirectional recurrent neural network based on the Long Short Term Memory (LSTM) architecture.
+
+### Preparing inputs
+
+```{r}
+library(keras) # for neural networks
+set.seed(0)
+
+# Coerce variable to integer to work with Keras
+X_train$Y <- as.integer(levels(X_train$Y))[X_train$Y]
+X_test$Y <- as.integer(levels(X_test$Y))[X_test$Y]
+
+# X_train <- X_train %>% mutate(textLength = lengths(strsplit(cleaned_text, ' ')))
+# summary(X_train$textLength)
+
+# Only consider 1st 300 words of article
+maxlen <- 300
+
+# Tokenize words in dataset i.e.
+# generates the word index and map 
+# each word to an integer other than 0
+# Use num_words = vsize as argument in text_tokenizer
+# to limit vocabulary size
+tokenizer <- text_tokenizer() %>% fit_text_tokenizer(X$cleaned_text)
+
+# Convert sequence of text into list of indexes 
+# (1 - vsize) with 0 padding to equalize length 
+# of sequences across all documents. 
+# Returns array of dimension N * maxlen
+trg_data <- texts_to_sequences(tokenizer, X_train$cleaned_text) %>% 
+            pad_sequences(maxlen = maxlen, truncating = "post")  
+xTest <- texts_to_sequences(tokenizer, X_test$cleaned_text) %>% 
+            pad_sequences(maxlen = maxlen, truncating = "post")
+
+# Word index acts as lookup table to dictionary
+# of words in training set. Same word index is
+# used on test set. Has dimension vsize or size
+# of dictionary on training set.
+word_index <- tokenizer$word_index
+
+# Split training set into 80% train and 20%
+# validation set for hyperparameter tuning
+ind <- which(runif(nrow(X_train)) < 0.8)
+xTrain <- trg_data[ind, ]
+xVal <- trg_data[-ind, ]
+yTrain <- X_train[ind, ]$Y 
+yVal <- X_train[-ind, ]$Y 
+yTest <- X_test$Y
+
+# cat("Found", length(word_index), "unique tokens.\n")  # vocabulary size
+# dim(trg_data)
+# dim(xTrain)
+# dim(xVal)
+# dim(yTrain)
+# dim(yVal)
+# dim(xTest)
+# dim(yTest)
+```
+
+### Building matrix of embedding weights
+
+```{r}
+# Construct embedding matrix of dimension 
+# vsize + 1 * embedding dimension, where vsize
+# is size of vocabulary in training set
+vsize <- length(word_index)
+embed_dim <- 100
+
+embedding_weights <- c() 
+embedding_weights <- sapply(names(word_index), function(word) {
+    wd_embedding <- as.vector(ftmodel$wv[word])
+    if (is.null(wd_embedding)) {
+            wd_embedding <- rep(0, embed_dim)
+        }
+    embedding_weights <- rbind(embedding_weights, wd_embedding)
+}) %>% t() %>% rbind(rep(0, embed_dim), .)
+# dim(embedding_weights)
+
+# saveRDS(embedding_weights, file = "./embed_mat.RDS")
+
+```
+
+### Define Model
+
+```{r}
+epochs <- 10
+set.seed(0)
+
+# Define model (needs numpy==1.18.5)
+bilstm_nn <- keras_model_sequential() %>% 
+  layer_embedding(input_dim = vsize + 1, output_dim = embed_dim, 
+                  input_length = maxlen, mask_zero = T) %>% 
+  bidirectional(layer_lstm(units = 64, activation = "tanh")) %>%  # units = dimension of activations in RNN cell
+  layer_dropout(0.2) %>% 
+  layer_dense(units = 1, activation = "sigmoid") 
+
+get_layer(bilstm_nn, index = 1) %>% 
+  set_weights(list(embedding_weights)) %>%
+  freeze_weights()  # disable update of word embeddings
+
+bilstm_nn %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adam(lr = 0.002),
+  metrics = c('accuracy')
+)
+
+summary(bilstm_nn)
+
+test_history <- bilstm_nn %>% fit(xTrain, yTrain, epochs = epochs, batch = 64, 
+                                  validation_data = list(xVal, yVal), 
+                                  verbose = 2)
+
+# save_model_hdf5(bilstm_nn, "./bilstm_mod.h5")
+
+# pdf("lstm_ft.pdf",  width = 7.5, height = 5)
+
+plot(test_history)
+
+# dev.off()
+
+
+# Model with 2 stacked RNN layers
+bilstm_nn_stacked <- keras_model_sequential() %>% 
+  layer_embedding(input_dim = vsize + 1, output_dim = embed_dim, 
+                  input_length = maxlen, mask_zero = T) %>% 
+  bidirectional(layer_lstm(units = 64, activation = "tanh", return_sequences = T)) %>%  # units = dimension of activations in RNN cell
+  layer_dropout(0.2) %>% 
+  layer_lstm(units = 64, activation = "tanh", return_sequences = F) %>%
+  layer_dropout(0.2) %>%
+  layer_dense(units = 1, activation = "sigmoid") 
+
+get_layer(bilstm_nn_stacked, index = 1) %>% 
+  set_weights(list(embedding_weights)) %>%
+  freeze_weights()  # disable update of word embeddings
+
+bilstm_nn_stacked %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adam(lr = 0.002),
+  metrics = c('accuracy')
+)
+
+summary(bilstm_nn_stacked)
+
+test_history_2 <- bilstm_nn_stacked %>% fit(xTrain, yTrain, epochs = 15, batch = 64, 
+                                            validation_data = list(xVal, yVal),
+                                            verbose = 2)
+
+# save_model_hdf5(bilstm_nn_stacked, "./bilstm_stacked_mod.h5")
+
+# pdf("stacked_lstm_ft.pdf",  width = 7.5, height = 5)
+
+plot(test_history_2)
+
+# dev.off()
+```
+
+### Model Evaluation
+
+```{r}
+library(yardstick) # for accuracy metrics
+preds <- predict_classes(bilstm_nn, xTest)
+preds_2 <- predict_classes(bilstm_nn_stacked, xTest)
+
+
+recode <- function(x) {
+    as.factor(ifelse(x == 1, "Fake", "Real"))
+}
+pred_class <- recode(preds)
+pred_class_2 <- recode(preds_2)
+true_class <- recode(X_test$Y)
+
+# Confusion matrix
+cat("Confusion Matrix for BiLSTM model")
+
+table("Prediction" = pred_class, "Actual" = true_class)
+
+cat("Confusion Matrix for Stacked BiLSTM-LSTM model")
+
+table("Prediction" = pred_class_2, "Actual" = true_class)
+
+# Accuracy metrics - model 1
+data.frame(
+           Accuracy = accuracy_vec(pred_class, true_class),
+           `Balanced Accuracy` = bal_accuracy_vec(true_class, pred_class),
+           Recall = sens_vec(pred_class, true_class),
+           Precision = precision_vec(pred_class, true_class),
+           F1 = f_meas_vec(pred_class, true_class)
+           )
+
+
+# Accuracy metrics - model 2
+data.frame(
+           Accuracy = accuracy_vec(pred_class_2, true_class),
+           `Balanced Accuracy` = bal_accuracy_vec(true_class, pred_class_2),
+           Recall = sens_vec(pred_class_2, true_class),
+           Precision = precision_vec(pred_class_2, true_class),
+           F1 = f_meas_vec(pred_class_2, true_class)
+           )
+```
+
+## BERT
+
+For sequence classification, we do not require the decoder block. We will fine-tune a pretrained model `bert-base-uncased` that uses 12 transformer layers, 768-dimensional embeddings and 12 attention heads which has approximately 110M parameters. The uncased model is trained on a corpus of lowercase text and our inputs will also be converted to lowercase text. Inputs to the model are token embeddings added with its positional encoding of the sequence. Token embeddings are words encoded into vectors using the WordPiece model, while positional embeddings encode positional information of the words.
+
+The BERT model requires special tokens CLS and SEP to denote the start and end of a sequence respectively, although it is designed to be used for two-sentence tasks i.e. when the input is a pair of sequences. In the case of single input sequence classification, the CLS token embedding at the final transformer layer is taken as the aggregated representation of the input text by the classifier.
+
+There is one more major difference between BERT's word embeddings and e.g. FastText's. Recall how vector representations of words with similar semantic meaning in FastText were similar, i.e. had a short distance between them. This allowed our model to group similar words together. BERT takes this one step further. A word's vector representation is not static anymore but depends on context. Consequently, the vector for "broke" is different when it's in a context of "money" vs. " a record". This immensely improves contextual awareness and might benefit predictions in many cases.
+
+```{r}
+# Load transformers library from huggingface
+# py_install("transformers==4.10", pip = TRUE) 
+transformers <- import("transformers")
+
+library(tensorflow) # backend library of keras
+
+# Load pretrained "bert-base-uncased" model -
+# 12-layers, 768-hidden, 12-heads, ~110M parameters
+# Model is trained on lowercase words only
+tokenizer <- transformers$BertTokenizer$from_pretrained("bert-base-uncased")
+model <- transformers$TFBertForSequenceClassification$from_pretrained("bert-base-uncased", num_labels = 2)
+```
+
+### Preparing Inputs
+
+To feed our text to BERT, it must be split into tokens, and then these tokens must be mapped to their index in the tokenizer vocabulary. The tokenization must be performed by the tokenizer included with BERT. Specifically, we will
+
+* Split the sentence into tokens
+* Pad & truncate all sentences to a single constant length
+* Add special tokens CLS to the start and SEP to the end of each sentence
+* Map the tokens to their IDs.
+* Explicitly differentiate real tokens from padding tokens with the “attention mask”
+
+These steps are taken care of with the `encode_plus` function provided by the tokenizer.
+
+Note: The “attention mask” is simply an array of 1s and 0s indicating which tokens are padding and which aren’t. This mask tells the “Self-Attention” mechanism in BERT not to incorporate these PAD tokens into its interpretation of the sentence.
+
+```{r}
+# Hyperparameters. Recommended values are
+# Batch size: 16, 32
+# Learning rate (Adam): 5e-5, 3e-5, 2e-5
+# Number of epochs: 2, 3, 4
+# Reference: Appendix A.3 from 
+# https://arxiv.org/pdf/1810.04805.pdf
+max_len <- 300L  # max length of sequences
+epochs <- 2
+batch_size <- 16
+lr <- 2e-5
+
+input_ids <- list()
+attention_masks <- list()
+labels <- list()
+
+# Function to process data into required input
+prepareData <- function(data) {
+    for (i in 1: nrow(data)) {
+        toks <- tokenizer$encode_plus(data[["cleaned_text"]][i],
+                                      add_special_tokens = T,
+                                      max_length = max_len,
+                                      pad_to_max_length = T,
+                                      return_attention_mask = T)
+        
+        token_id <- toks["input_ids"] %>% t() %>% list()
+        mask <- toks["attention_mask"] %>% t() %>% list()
+        
+        lbl <- data[["Y"]][i] %>% t()
+        input_ids <- input_ids %>% append(token_id)  # list of row matrices
+        attention_masks <- attention_masks %>% append(mask)  # list of row matrices
+        labels <- labels %>% append(lbl)
+    }
+    # Bind all row matrices into a single matrix 
+    # for input tokens, attention masks and labels
+    list(do.call(plyr::rbind.fill.matrix, input_ids), 
+         do.call(plyr::rbind.fill.matrix, attention_masks),
+         do.call(plyr::rbind.fill.matrix, labels))
+}
+
+train_ <- prepareData(X_train)
+test_ <- prepareData(X_test)
+
+# Check dimensions of input matrices
+# N * max_len for input tokens and masks
+# training set
+dim(train_[[1]])
+dim(train_[[2]])
+dim(train_[[3]])
+cat("\n")
+
+# test set
+dim(test_[[1]])
+dim(test_[[2]])
+dim(test_[[3]])
+```
+
+### Training
+
+The pretrained model TFBertForSequenceClassification simply adds a dense layer (sigmoid unit for binary classification) on top of the pretrained BERT encoder block. Consequently, we will mainly train our classifier layer while most other layers will only be minimally impacted. In a sense, we use the general language understanding of the pretrained model and improve its understanding of our unique domain. Moreover, we teach it to solve a specific task. In our case, this will be real/fake news classification.
+
+```{r}
+model %>% compile( 
+    optimizer = tf$keras$optimizers$Adam(learning_rate = lr, epsilon = 1e-08, clipnorm = 1.0),
+    loss = tf$losses$SparseCategoricalCrossentropy(from_logits=T),
+    metrics = tf$metrics$SparseCategoricalAccuracy('accuracy')
+)
+
+summary(model)
+
+history <- model %>% fit(list(train_[[1]], train_[[2]]), train_[[3]], 
+                         batch = batch_size,
+                         epochs = epochs, 
+                         validation_split = 0.2, 
+                         verbose = 2)
+model %>% save_model_tf("bert_mod")
+
+plot(history)
+```
+
+### Model Evaluation
+
+```{r}
+preds_bert <- model$predict(list(test_[[1]], test_[[2]])) # logits
+pred_labels <- max.col(preds_bert$logits)-1
+
+pred_class_bert <- recode(pred_labels)
+true_class_bert <- recode(X_test$Y)
+
+# Confusion matrix
+table("Prediction" = pred_class_bert, "Actual" = true_class_bert)
+
+# Accuracy metrics
+data.frame(
+           Accuracy = accuracy_vec(pred_class_bert, true_class_bert),
+           Recall = sens_vec(pred_class_bert, true_class_bert),
+           Precision = precision_vec(pred_class_bert, true_class_bert),
+           F1 = f_meas_vec(pred_class_bert, true_class_bert)
+           )
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
